@@ -1,15 +1,15 @@
 # Pedestrian Trajectory Prediction
-![Prediction](<prediction.png>)
+![prediction](<prediction.png>)
 Goal-conditioned, map-aware, multi-modal trajectory predictor for pedestrians and cyclists evaluated on the nuScenes dataset. 
 
 ## Performance (nuScenes v1.0-mini val split)
 
 | Metric | Value |
 |---|---|
-| minADE_3 | TBD |
-| minFDE_3 | TBD |
-| MissRate_2_3 | TBD |
-| OffRoadRate | TBD |
+| minADE_3 | 0.308 |
+| minFDE_3 | 0.518 |
+| MissRate_2_3 | 0.046 |
+| OffRoadRate | 1.00 |
 
 ## Architecture
 
