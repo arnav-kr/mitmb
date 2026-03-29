@@ -1,1 +1,40 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local dataset and archives
+data/
 nuscenes.tgz
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Training artifacts
+checkpoints/
+outputs/
+
+# Logs
+*.log
