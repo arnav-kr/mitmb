@@ -1,65 +1,70 @@
 # Pedestrian Trajectory Prediction
 ![prediction](<prediction.png>)
-Goal-conditioned, map-aware, multi-modal trajectory predictor for pedestrians and cyclists evaluated on the nuScenes dataset. 
 
-## Performance (nuScenes v1.0-mini val split)
+## Project overview
+Goal-conditioned, map-aware, multi-modal trajectory predictor for pedestrians and cyclists, developed for the MAHE Mobility Challenge (PS1). Standard deterministic models predict a single average path, which fails in highly stochastic urban environments. This architecture resolves this by forecasting K=3 distinct, probable future trajectories. It fuses agent coordinate history, social interactions via cross-attention, and physical map boundaries to ensure predictions are both diverse and strictly compliant with drivable/walkable surfaces.
 
-| Metric | Value |
-|---|---|
-| minADE_3 | 0.308 |
-| minFDE_3 | 0.518 |
-| MissRate_2_3 | 0.046 |
-| OffRoadRate | 1.00 |
+## Example outputs / results
+Performance evaluated on the nuScenes v1.0-mini validation split.
 
-## Architecture
+| Metric | Value | Description |
+|---|---|---|
+| minADE_3 | 0.308 | Minimum Average Displacement Error across 3 modes. |
+| minFDE_3 | 0.518 | Minimum Final Displacement Error across 3 modes. |
+| MissRate_2_3 | 0.046 | Fraction of samples where all 3 modes have max L2 > 2m. |
+| OffRoadRate | 1.00 | Fraction of primary predictions intersecting non-drivable pixels. |
 
-The model predicts $K=3$ future trajectories based on 2 seconds of history (4 timesteps at 2Hz) to predict 3 seconds of future motion (6 timesteps).
+Visual outputs are generated via the included visualization pipeline, mapping past history (blue), ground truth (green), and predicted modes (dashed) over semantic map rasters.
 
-```text
-Past trajectory (4 steps × 5 features)
-    └─► AgentEncoder (MLP)
-                └─► agent token (256d)
-                        │
-Neighbours (≤10 × 4 steps × 4 features)
-    └─► NeighbourEncoder (shared MLP)
-                └─► N tokens (256d each)
-                        │
-                ┌───────▼────────┐
-                │ SocialAttention│  cross-attention: ego queries neighbours
-                └───────┬────────┘
-                        │ social context (256d)
-Map raster (3×100×100)  │
-    └─► MapEncoder (CNN)│
-                └──────►│
-                ┌───────▼────────┐
-                │  ContextFusion │  concat + MLP
-                └───────┬────────┘
-                        │ context (256d)
-                ┌───────▼────────────────────┐
-                │  GoalPredictor             │  → K goal endpoints (K=3)
-                └───────┬────────────────────┘
-                        │ goals (K×2)
-                ┌───────▼────────────────────┐
-                │  TrajectoryDecoder (GRU)   │  goal-conditioned, per-mode
-                └───────┬────────────────────┘
-                        │ K trajectories (K×6×2)
-                ┌───────▼────────────────────┐
-                │  ModeClassifier            │  → K log-probabilities
-                └────────────────────────────┘
-```
+## Model architecture
+The system predicts 3 seconds of future motion (6 timesteps) based on 2 seconds of history (4 timesteps at 2Hz).
+
+    Past trajectory (4 steps × 5 features)
+        └─► AgentEncoder (MLP)
+                    └─► agent token (256d)
+                            │
+    Neighbours (≤10 × 4 steps × 4 features)
+        └─► NeighbourEncoder (shared MLP)
+                    └─► N tokens (256d each)
+                            │
+                    ┌───────▼────────┐
+                    │ SocialAttention│  cross-attention: ego queries neighbours
+                    └───────┬────────┘
+                            │ social context (256d)
+    Map raster (3×100×100)  │
+        └─► MapEncoder (CNN)│
+                    └──────►│
+                    ┌───────▼────────┐
+                    │  ContextFusion │  concat + MLP
+                    └───────┬────────┘
+                            │ context (256d)
+                    ┌───────▼────────────────────┐
+                    │  GoalPredictor             │  → K goal endpoints (K=3)
+                    └───────┬────────────────────┘
+                            │ goals (K×2)
+                    ┌───────▼────────────────────┐
+                    │  TrajectoryDecoder (GRU)   │  goal-conditioned, per-mode
+                    └───────┬────────────────────┘
+                            │ K trajectories (K×6×2)
+                    ┌───────▼────────────────────┐
+                    │  ModeClassifier            │  → K log-probabilities
+                    └────────────────────────────┘
 
 ### Technical Characteristics
+* **Coordinate Frame:** Agent-frame normalized. Origin is (0,0) and heading aligns with the +x axis, enforcing the learning of relative motion patterns.
+* **Social Context:** Cross-attention mechanism computing interactions over a maximum of 10 neighbors within a 30m radius.
+* **Map Integration:** 3-channel binary map rasterization (walkway, pedestrian crossing, drivable surface) processed via a lightweight custom CNN.
+* **Loss Formulation:** Winner-takes-all (WTA) backpropagation. Loss routes exclusively through the mode with the minimum FDE to the ground truth, preventing mode collapse. Gradients are scaled by visibility tokens to down-weight noisy, occluded samples.
+* **Decoding:** Autoregressive GRU decoding of step deltas with a linear endpoint correction to enforce goal-mode consistency.
 
-* **Coordinate Frame:** Agent-frame normalized. Origin is $(0,0)$ and heading aligns with the $+x$ axis. Ensures learning of relative motion patterns.
-* **Social Context:** Cross-attention mechanism over a maximum of 10 neighbors within a 30m radius.
-* **Map Integration:** 3-channel binary map rasterization (walkway, pedestrian crossing, drivable surface) processed via CNN.
-* **Loss Formulation:** Winner-takes-all (WTA) backpropagation. Loss is computed exclusively through the mode with the minimum FDE to the ground truth to prevent mode collapse. Gradients are scaled by ground truth visibility levels to down-weight occluded, noisy samples.
-* **Decoding:** Decodes step deltas autoregressively via GRU. An endpoint linear correction is applied to enforce consistency with the predicted goal mode.
-* **Metrics Check:** MissRate evaluates strict confidence failures (distance > 2m). OffRoadRate checks trajectory intersections with non-drivable map pixels.
+## Dataset used
+Trained and evaluated on the **nuScenes** dataset. 
+* Targets vulnerable road users: pedestrians (adult, child, construction worker, mobility device, police, stroller, wheelchair) and bicycles.
+* Data is preprocessed into agent-centric local frames. Map data is rasterized locally.
+* Dynamic 90-degree scene and map rotation augmentations are applied during training to ensure rotational invariance and expand the effective dataset.
 
-## Requirements and Setup
-
-Install prerequisites. Requires `torch`, `numpy`, and `nuscenes-devkit`.
+## Setup & installation instructions
+Requires `torch`, `numpy`, and `nuscenes-devkit`.
 
 ```bash
 pip install -r requirements.txt
@@ -73,39 +78,32 @@ data/nuscenes/
 ├── maps/
 └── samples/
 ```
-
-*Note: The codebase defaults to `v1.0-mini`. Modify `config.py` to run on the full `trainval` split.*
+*Note: Default configuration targets `v1.0-mini`. Adjust `config.py` for full `trainval` splits.*
 
 ## Usage
+### How to run the code
+All network dimensions, learning rate schedules, and data filtering constraints are centralized in `config.py`.
 
-All hyperparameters, including learning rate schedules, network dimensions, and data filtering constraints, are defined in `config.py`. 
-
-### Training
-
-Initiates training with a linear warmup and cosine decay. Applies 90-degree map and coordinate rotation augmentation dynamically. Best checkpoints are saved based on validation FDE.
+**Training**
+Initiates training with a 5-epoch linear warmup and cosine decay. Automatically applies rotation augmentation and saves best checkpoints based on validation FDE.
 
 ```bash
 python train.py --dataroot ./data/nuscenes --epochs 80 --batch_size 64
 ```
-
-To ignore previous checkpoints and start fresh:
+To force a fresh training cycle, ignoring existing checkpoints:
 ```bash
 python train.py --fresh
 ```
 
-Training history is logged to `outputs/training_history.json`.
-
-### Evaluation
-
-Evaluates the validation split and outputs results. Generates `outputs/results.json` containing aggregate metrics and `outputs/predictions.json` adhering to the nuScenes submission format.
+**Evaluation**
+Evaluates the validation split. Generates `outputs/results.json` with aggregate metrics and `outputs/predictions.json` formatted to the nuScenes submission standard.
 
 ```bash
 python evaluate.py --dataroot ./data/nuscenes --checkpoint ./checkpoints/best.pt
 ```
 
-### Visualization
-
-Generates map-overlaid trajectory plots for visual debugging and presentation. Saves a grid format image to `outputs/viz/trajectory_predictions.png`.
+**Visualization**
+Generates map-overlaid trajectory plots for debugging and presentation. Saves to `outputs/viz/trajectory_predictions.png`.
 
 ```bash
 python visualize.py --dataroot ./data/nuscenes --n_samples 16
@@ -126,7 +124,6 @@ python visualize.py --dataroot ./data/nuscenes --n_samples 16
 ```
 
 ## References
-
-* nuScenes Prediction Challenge: [https://www.nuscenes.org/prediction](https://www.nuscenes.org/prediction)
+* nuScenes Prediction Challenge: https://www.nuscenes.org/prediction
 * Trajectron++: Ivanovic & Pavone, ECCV 2020
 * AgentFormer: Yuan et al., ICCV 2021
