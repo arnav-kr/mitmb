@@ -123,8 +123,9 @@ def main(args):
         val_ds,
         batch_size=64,
         shuffle=False,
-        num_workers=4,
+        num_workers=cfg.data.num_workers,
         collate_fn=collate_fn,
+        pin_memory=cfg.data.pin_memory,
     )
 
     # ------------------------------------------------------------------

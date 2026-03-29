@@ -9,8 +9,9 @@ Usage:
 import argparse
 import json
 import os
-import math
 import time
+import random
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -37,7 +38,14 @@ def move_batch(batch, device):
     return out
 
 
-def run_epoch(model, loader, criterion, optimizer, device, train: bool):
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def run_epoch(model, loader, criterion, optimizer, device, scaler, train: bool):
     model.train(train)
     total_loss = total_ade = total_fde = 0.0
     n_batches = 0
@@ -49,26 +57,37 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool):
         batch = move_batch(batch, device)
 
         with torch.set_grad_enabled(train):
-            trajs, goals, log_probs = model(
-                batch["agent_state"],
-                batch["neighbor_states"],
-                batch["neighbor_mask"],
-                batch["map_raster"],
-            )
+            amp_enabled = (device.type == "cuda")
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                trajs, goals, log_probs = model(
+                    batch["agent_state"],
+                    batch["neighbor_states"],
+                    batch["neighbor_mask"],
+                    batch["map_raster"],
+                )
 
-            loss, metrics = criterion(
-                trajs, goals, log_probs,
-                batch["future"],
-                batch["visibility_weight"],
-            )
+                loss, metrics = criterion(
+                    trajs, goals, log_probs,
+                    batch["future"],
+                    batch["visibility_weight"],
+                )
 
         if train:
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), cfg.train.grad_clip
-            )
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.train.grad_clip
+                )
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.train.grad_clip
+                )
+                optimizer.step()
 
         total_loss += metrics["loss"]
         total_ade  += metrics["ade"]
@@ -98,6 +117,8 @@ def main(args):
     if args.batch_size:
         cfg.train.batch_size = args.batch_size
 
+    set_seed(cfg.train.seed)
+
     os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
 
@@ -114,18 +135,18 @@ def main(args):
         train_ds,
         batch_size=cfg.train.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=cfg.data.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=cfg.data.pin_memory,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.train.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=cfg.data.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=cfg.data.pin_memory,
     )
 
     # ------------------------------------------------------------------
@@ -136,6 +157,7 @@ def main(args):
     print(f"[train] Parameters: {n_params:,}")
 
     criterion = TrajectoryLoss()
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.train.lr,
@@ -184,8 +206,8 @@ def main(args):
     for epoch in range(start_epoch, cfg.train.num_epochs):
         t0 = time.time()
 
-        train_m = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
-        val_m   = run_epoch(model, val_loader,   criterion, optimizer, device, train=False)
+        train_m = run_epoch(model, train_loader, criterion, optimizer, device, scaler, train=True)
+        val_m   = run_epoch(model, val_loader,   criterion, optimizer, device, scaler, train=False)
 
         scheduler.step()
         lr = scheduler.get_last_lr()[0]

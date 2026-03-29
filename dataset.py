@@ -10,7 +10,6 @@ Key design decisions:
   • Per-sample visibility weight for loss down-weighting of noisy labels
 """
 
-import os
 import math
 import numpy as np
 import torch
@@ -23,11 +22,9 @@ from config import cfg
 try:
     from nuscenes.nuscenes import NuScenes
     from nuscenes.prediction import PredictHelper
-    from nuscenes.prediction.input_representation.static_layers import (
-        StaticLayerRasterizer,
-    )
     from nuscenes.map_expansion.map_api import NuScenesMap
-    from nuscenes.prediction.helper import get_prediction_challenge_split
+    from nuscenes.eval.prediction.splits import get_prediction_challenge_split
+    from nuscenes.utils.splits import create_splits_scenes
     from pyquaternion import Quaternion
     NUSCENES_AVAILABLE = True
 except ImportError:
@@ -61,11 +58,45 @@ def quaternion_to_yaw(q_list: List[float]) -> float:
     return q.yaw_pitch_roll[0]
 
 
+def ensure_xy_array(arr) -> np.ndarray:
+    """
+    Convert various devkit return formats to float32 array shaped (N, 2).
+    Handles empty lists, nested lists, dict rows with x/y, and malformed outputs.
+    """
+    if arr is None:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
+        out = []
+        for row in arr:
+            x = row.get("x", 0.0)
+            y = row.get("y", 0.0)
+            out.append([x, y])
+        return np.asarray(out, dtype=np.float32).reshape(-1, 2)
+
+    out = np.asarray(arr, dtype=np.float32)
+
+    if out.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    if out.ndim == 1:
+        if out.shape[0] >= 2:
+            return out[-2:].reshape(1, 2)
+        # Not interpretable as x,y pairs
+        return np.zeros((0, 2), dtype=np.float32)
+
+    if out.shape[-1] >= 2:
+        return out[..., -2:].reshape(-1, 2)
+
+    return np.zeros((0, 2), dtype=np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Main dataset
 # ---------------------------------------------------------------------------
 
 class NuScenesDataset(Dataset):
+    _split_fallback_logged = False
 
     def __init__(self, split: str = "train"):
         """
@@ -94,7 +125,8 @@ class NuScenesDataset(Dataset):
         self.helper = PredictHelper(self.nusc)
 
         # Load split tokens: each token is "instance_token_sample_token"
-        all_tokens = get_prediction_challenge_split(split, dataroot=self.cfg_d.dataroot)
+        split_name = self._resolve_split_name(split)
+        all_tokens = self._load_split_tokens(split_name)
 
         # Filter to our agent categories and minimum visibility
         self.tokens = self._filter_tokens(all_tokens)
@@ -102,6 +134,66 @@ class NuScenesDataset(Dataset):
 
         # Cache maps by location name (Singapore-OneNorth, boston-seaport, etc.)
         self._map_cache: Dict[str, NuScenesMap] = {}
+
+    def _resolve_split_name(self, split: str) -> str:
+        """
+        nuScenes-mini does not expose the same train/train_val/val setup as trainval.
+        Map canonical names to mini-compatible names when needed.
+        """
+        if "mini" in self.cfg_d.version:
+            mapping = {
+                "train": "mini_train",
+                "train_val": "mini_val",
+                "val": "mini_val",
+            }
+            return mapping[split]
+        return split
+
+    def _load_split_tokens(self, split_name: str) -> List[str]:
+        """Try the official split API first, then build from scene split if metadata is absent."""
+        try:
+            return get_prediction_challenge_split(split_name, dataroot=self.cfg_d.dataroot)
+        except Exception as e:
+            if isinstance(e, FileNotFoundError):
+                if not NuScenesDataset._split_fallback_logged:
+                    print(
+                        "[dataset] prediction_scenes.json not found in maps/prediction; "
+                        "building tokens from scene splits (mini-compatible fallback)."
+                    )
+                    NuScenesDataset._split_fallback_logged = True
+                return self._build_tokens_from_scene_split(split_name)
+            raise RuntimeError(f"Unable to load prediction split '{split_name}': {e}")
+
+    def _build_tokens_from_scene_split(self, split_name: str) -> List[str]:
+        """
+        Fallback for environments where maps/prediction/prediction_scenes.json is absent.
+        Builds prediction tokens from all annotations in scenes that belong to split_name.
+        """
+        scene_splits = create_splits_scenes()
+        scene_names = set(scene_splits.get(split_name, []))
+        if not scene_names:
+            raise RuntimeError(f"Unknown scene split '{split_name}'")
+
+        tokens: List[str] = []
+        seen = set()
+
+        for scene in self.nusc.scene:
+            if scene["name"] not in scene_names:
+                continue
+
+            sample_token = scene["first_sample_token"]
+            while sample_token:
+                sample = self.nusc.get("sample", sample_token)
+                for ann_tok in sample["anns"]:
+                    ann = self.nusc.get("sample_annotation", ann_tok)
+                    key = f"{ann['instance_token']}_{sample_token}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    tokens.append(key)
+                sample_token = sample["next"]
+
+        return tokens
 
     # ------------------------------------------------------------------
     # Filtering
@@ -148,11 +240,16 @@ class NuScenesDataset(Dataset):
         yaw: float,          # agent heading
     ) -> np.ndarray:
         """Returns (C, H, W) binary float32 map centred on agent, agent-frame aligned."""
-        nmap = self._get_map(location)
+        canvas_size = (self.cfg_d.map_canvas_size, self.cfg_d.map_canvas_size)
+        try:
+            nmap = self._get_map(location)
+        except Exception:
+            # Keep pipeline alive when map expansion files are unavailable.
+            return np.zeros((len(self.cfg_d.map_layers), *canvas_size), dtype=np.float32)
+
         half = self.cfg_d.map_patch_size / 2.0
         patch_box = (origin[0], origin[1], self.cfg_d.map_patch_size, self.cfg_d.map_patch_size)
         patch_angle = math.degrees(yaw)   # NuScenesMap expects degrees
-        canvas_size = (self.cfg_d.map_canvas_size, self.cfg_d.map_canvas_size)
 
         masks = []
         for layer in self.cfg_d.map_layers:
@@ -187,10 +284,10 @@ class NuScenesDataset(Dataset):
             past_xy_global = self.helper.get_past_for_agent(
                 inst_tok, samp_tok,
                 seconds=self.cfg_d.past_seconds,
-                in_agent_frame=False,
+                in_agent_frame=True,
                 just_xy=True,
             )  # (T, 2), most-recent-first
-            past_xy_global = past_xy_global[::-1].copy()   # oldest-first
+            past_xy_global = ensure_xy_array(past_xy_global)[::-1].copy()   # oldest-first
         except Exception:
             past_xy_global = np.zeros((0, 2), dtype=np.float32)
 
@@ -202,10 +299,7 @@ class NuScenesDataset(Dataset):
         past_xy_global = past_xy_global[-T:]   # (T, 2)
 
         # Include current position as the T+1-th point
-        all_xy_global = np.vstack([past_xy_global, origin.reshape(1, 2)])  # (T+1, 2)
-
-        # Transform to agent frame
-        all_xy_local = to_agent_frame(all_xy_global, origin, yaw)   # (T+1, 2)
+        all_xy_local = np.vstack([past_xy_global, np.zeros((1, 2), dtype=np.float32)])
         past_xy_local = all_xy_local[:T]                             # (T, 2)
 
         # Velocities: finite differences in agent frame (m/s)
@@ -217,9 +311,12 @@ class NuScenesDataset(Dataset):
             hr = self.helper.get_heading_change_rate_for_agent(inst_tok, samp_tok)
         except Exception:
             hr = 0.0
+        if not np.isfinite(hr):
+            hr = 0.0
         heading_rate = np.full((T, 1), hr, dtype=np.float32)
 
         state = np.concatenate([past_xy_local, vel, heading_rate], axis=1)  # (T, 5)
+        state = np.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
         return state.astype(np.float32)
 
     # ------------------------------------------------------------------
@@ -272,7 +369,7 @@ class NuScenesDataset(Dataset):
                     in_agent_frame=False,
                     just_xy=True,
                 )
-                nb_past_global = nb_past_global[::-1].copy()
+                nb_past_global = ensure_xy_array(nb_past_global)[::-1].copy()
             except Exception:
                 nb_past_global = np.zeros((0, 2), dtype=np.float32)
 
@@ -297,6 +394,7 @@ class NuScenesDataset(Dataset):
             neighbor_mask[slot] = True
             slot += 1
 
+        neighbor_states = np.nan_to_num(neighbor_states, nan=0.0, posinf=0.0, neginf=0.0)
         return neighbor_states, neighbor_mask
 
     # ------------------------------------------------------------------
@@ -316,9 +414,10 @@ class NuScenesDataset(Dataset):
             fut_global = self.helper.get_future_for_agent(
                 inst_tok, samp_tok,
                 seconds=self.cfg_d.future_seconds,
-                in_agent_frame=False,
+                in_agent_frame=True,
                 just_xy=True,
             )  # (T, 2), oldest-first
+            fut_global = ensure_xy_array(fut_global)
         except Exception:
             fut_global = np.zeros((T, 2), dtype=np.float32)
 
@@ -326,7 +425,9 @@ class NuScenesDataset(Dataset):
             pad_val = fut_global[-1:] if len(fut_global) > 0 else np.zeros((1, 2))
             fut_global = np.vstack([fut_global, np.tile(pad_val, (T - len(fut_global), 1))])
         fut_global = fut_global[:T]   # (T, 2)
-        return to_agent_frame(fut_global, origin, yaw).astype(np.float32)
+        fut = fut_global.astype(np.float32)
+        fut = np.nan_to_num(fut, nan=0.0, posinf=0.0, neginf=0.0)
+        return fut
 
     # ------------------------------------------------------------------
     # Rotation augmentation
@@ -337,9 +438,14 @@ class NuScenesDataset(Dataset):
         agent_state: np.ndarray,    # (T, 5)
         neighbor_states: np.ndarray, # (N, T, 4)
         future: np.ndarray,          # (T_fut, 2)
+        map_raster: np.ndarray,      # (C, H, W)
     ):
-        """Random scene rotation — all coordinates rotate together."""
-        angle = np.random.uniform(0, 2 * math.pi)
+        """
+        Random scene rotation — all coordinates and map raster rotate together.
+        Uses 90-degree rotations so map_raster can be rotated exactly via np.rot90.
+        """
+        k = int(np.random.randint(0, 4))
+        angle = k * (math.pi / 2.0)
         R = rotation_matrix_2d(angle).T   # (2, 2) for row-vector multiplication
 
         def rot_xy(arr):
@@ -362,7 +468,9 @@ class NuScenesDataset(Dataset):
 
         fut_out = rot_xy(future)
 
-        return agent_out, nb_out, fut_out
+        map_out = np.rot90(map_raster, k=k, axes=(1, 2)).copy()
+
+        return agent_out, nb_out, fut_out, map_out
 
     # ------------------------------------------------------------------
     # Mock mode (no nuScenes installed)
@@ -418,8 +526,8 @@ class NuScenesDataset(Dataset):
 
             # Augmentation (training only)
             if self.is_train and self.cfg_t.use_rotation_aug:
-                agent_state, neighbor_states, future = self._augment(
-                    agent_state, neighbor_states, future
+                agent_state, neighbor_states, future, map_raster = self._augment(
+                    agent_state, neighbor_states, future, map_raster
                 )
 
             return {

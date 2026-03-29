@@ -1,16 +1,11 @@
-"""
-Central configuration for the MAHE Mobility Challenge — PS1 Trajectory Prediction.
-All hyperparameters live here; nothing is hardcoded in other files.
-"""
-
 from dataclasses import dataclass, field
 from typing import List
 
 
 @dataclass
 class DataConfig:
-    # nuScenes dataset root (set this to your local path)
-    dataroot: str = "./nuscenes"
+    # nuScenes dataset root
+    dataroot: str = "./data/nuscenes"
     version: str = "v1.0-mini"
 
     # Prediction horizon
@@ -44,8 +39,12 @@ class DataConfig:
         "ped_crossing",
         "drivable_surface",
     ])
-    map_patch_size: float = 40.0    # side length in metres, centred on agent
+    map_patch_size: float = 50.0    # side length in metres, centred on agent
     map_canvas_size: int = 100      # pixels (100×100 → 0.4 m/px resolution)
+
+    # Dataloader/runtime
+    num_workers: int = 2
+    pin_memory: bool = True
 
 
 @dataclass
@@ -62,6 +61,7 @@ class ModelConfig:
 
     # Multi-modal output
     num_modes: int = 3              # K trajectories predicted simultaneously
+    max_goal_radius: float = 15.0   # metres, goal endpoint clamp range
 
     # Input feature size per timestep: (x, y, vx, vy, heading_rate) = 5
     agent_input_size: int = 5
@@ -93,6 +93,9 @@ class TrainConfig:
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
     save_every: int = 10            # save checkpoint every N epochs
+
+    # Reproducibility
+    seed: int = 42
 
 
 @dataclass

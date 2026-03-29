@@ -222,6 +222,7 @@ class GoalPredictor(nn.Module):
         super().__init__()
         c = cfg.model
         K = c.num_modes
+        self.max_goal_radius = c.max_goal_radius
 
         self.net = nn.Sequential(
             nn.Linear(c.hidden_dim, c.hidden_dim),
@@ -233,7 +234,8 @@ class GoalPredictor(nn.Module):
         """context: (B, hidden_dim) → goals: (B, K, 2)"""
         B = context.shape[0]
         K = cfg.model.num_modes
-        return self.net(context).reshape(B, K, 2)
+        raw = self.net(context).reshape(B, K, 2)
+        return torch.tanh(raw) * self.max_goal_radius
 
 
 # ---------------------------------------------------------------------------
@@ -291,13 +293,28 @@ class TrajectoryDecoder(nn.Module):
             step_in = torch.zeros(B, 1, 2, device=context.device)
 
             steps = []
+            pos = torch.zeros(B, 1, 2, device=context.device)
             for _ in range(self.T_fut):
                 gru_out, h = self.gru(step_in, h)  # (B, 1, hidden)
                 delta = self.out_proj(gru_out)      # (B, 1, 2)
-                steps.append(delta)
+                pos = pos + delta
+                steps.append(pos)
                 step_in = delta   # feed previous output as next input
 
             traj_k = torch.cat(steps, dim=1)   # (B, T_fut, 2)
+
+            # Encourage geometric consistency: endpoint should align with goal_k.
+            # Apply a linear correction ramp so early points move less than late points.
+            end_err = (goal_k - traj_k[:, -1, :]).unsqueeze(1)  # (B, 1, 2)
+            ramp = torch.linspace(
+                1.0 / self.T_fut,
+                1.0,
+                self.T_fut,
+                device=context.device,
+                dtype=traj_k.dtype,
+            ).view(1, self.T_fut, 1)
+            traj_k = traj_k + ramp * end_err
+
             trajs.append(traj_k)
 
         return torch.stack(trajs, dim=1)   # (B, K, T_fut, 2)
