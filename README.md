@@ -1,23 +1,21 @@
-# Pedestrian Trajectory Prediction — MAHE Mobility Challenge (PS1)
+# Pedestrian Trajectory Prediction
+![Prediction](<prediction.png>)
+Goal-conditioned, map-aware, multi-modal trajectory predictor for pedestrians and cyclists evaluated on the nuScenes dataset. 
 
-Goal-conditioned, map-aware, multi-modal trajectory predictor for pedestrians and cyclists on nuScenes.
-
----
-
-## Results (val split)
+## Performance (nuScenes v1.0-mini val split)
 
 | Metric | Value |
 |---|---|
-| minADE\_3 | TBD after training |
-| minFDE\_3 | TBD after training |
-| MissRate\_2\_3 | TBD |
+| minADE_3 | TBD |
+| minFDE_3 | TBD |
+| MissRate_2_3 | TBD |
 | OffRoadRate | TBD |
-
----
 
 ## Architecture
 
-```
+The model predicts $K=3$ future trajectories based on 2 seconds of history (4 timesteps at 2Hz) to predict 3 seconds of future motion (6 timesteps).
+
+```text
 Past trajectory (4 steps × 5 features)
     └─► AgentEncoder (MLP)
                 └─► agent token (256d)
@@ -27,14 +25,14 @@ Neighbours (≤10 × 4 steps × 4 features)
                 └─► N tokens (256d each)
                         │
                 ┌───────▼────────┐
-                │ SocialAttention │  cross-attention: ego queries neighbours
+                │ SocialAttention│  cross-attention: ego queries neighbours
                 └───────┬────────┘
                         │ social context (256d)
 Map raster (3×100×100)  │
-    └─► MapEncoder (CNN) │
+    └─► MapEncoder (CNN)│
                 └──────►│
                 ┌───────▼────────┐
-                │  ContextFusion  │  concat + MLP
+                │  ContextFusion │  concat + MLP
                 └───────┬────────┘
                         │ context (256d)
                 ┌───────▼────────────────────┐
@@ -50,127 +48,85 @@ Map raster (3×100×100)  │
                 └────────────────────────────┘
 ```
 
-### Why this beats vanilla LSTM
+### Technical Characteristics
 
-| Aspect | Vanilla LSTM | This model |
-|---|---|---|
-| Input features | (x,y) only | (x,y, vx, vy, heading\_rate) |
-| Social context | None | Cross-attention over neighbours |
-| Map usage | None | CNN over 3-channel raster |
-| Output | 1 path | 3 goal-conditioned paths |
-| Coordinate frame | Global (broken) | Agent-frame normalised |
-| Visibility | Ignored | Weighted in loss |
-| Extra metrics | ADE/FDE | + MissRate + OffRoadRate |
+* **Coordinate Frame:** Agent-frame normalized. Origin is $(0,0)$ and heading aligns with the $+x$ axis. Ensures learning of relative motion patterns.
+* **Social Context:** Cross-attention mechanism over a maximum of 10 neighbors within a 30m radius.
+* **Map Integration:** 3-channel binary map rasterization (walkway, pedestrian crossing, drivable surface) processed via CNN.
+* **Loss Formulation:** Winner-takes-all (WTA) backpropagation. Loss is computed exclusively through the mode with the minimum FDE to the ground truth to prevent mode collapse. Gradients are scaled by ground truth visibility levels to down-weight occluded, noisy samples.
+* **Decoding:** Decodes step deltas autoregressively via GRU. An endpoint linear correction is applied to enforce consistency with the predicted goal mode.
+* **Metrics Check:** MissRate evaluates strict confidence failures (distance > 2m). OffRoadRate checks trajectory intersections with non-drivable map pixels.
 
----
+## Requirements and Setup
 
-## Setup
+Install prerequisites. Requires `torch`, `numpy`, and `nuscenes-devkit`.
 
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
-
-# 2. Download nuScenes v1.0-trainval from https://www.nuscenes.org/nuscenes
-#    and extract to ./data/nuscenes
-
-# 3. Download nuScenes map expansion v1.2 into the same folder
-
-# 4. Verify your folder structure:
-#    data/nuscenes/
-#    ├── v1.0-trainval/
-#    ├── maps/
-#    └── samples/
 ```
 
----
+Extract the nuScenes v1.0-mini dataset. The expected directory structure is:
 
-## Training
+```text
+data/nuscenes/
+├── v1.0-mini/
+├── maps/
+└── samples/
+```
+
+*Note: The codebase defaults to `v1.0-mini`. Modify `config.py` to run on the full `trainval` split.*
+
+## Usage
+
+All hyperparameters, including learning rate schedules, network dimensions, and data filtering constraints, are defined in `config.py`. 
+
+### Training
+
+Initiates training with a linear warmup and cosine decay. Applies 90-degree map and coordinate rotation augmentation dynamically. Best checkpoints are saved based on validation FDE.
 
 ```bash
-python train.py --dataroot ./data/nuscenes --epochs 80
+python train.py --dataroot ./data/nuscenes --epochs 80 --batch_size 64
 ```
 
-Training automatically:
-- Applies rotation augmentation (triples effective dataset size)
-- Uses linear warmup (5 epochs) + cosine LR decay
-- Saves best checkpoint by val FDE
-- Logs history to `outputs/training_history.json`
-
-To resume from a checkpoint (automatic):
-```bash
-python train.py   # picks up from checkpoints/latest.pt
-```
-
-To restart fresh:
+To ignore previous checkpoints and start fresh:
 ```bash
 python train.py --fresh
 ```
 
----
+Training history is logged to `outputs/training_history.json`.
 
-## Evaluation
+### Evaluation
+
+Evaluates the validation split and outputs results. Generates `outputs/results.json` containing aggregate metrics and `outputs/predictions.json` adhering to the nuScenes submission format.
 
 ```bash
-python evaluate.py --dataroot ./data/nuscenes
+python evaluate.py --dataroot ./data/nuscenes --checkpoint ./checkpoints/best.pt
 ```
 
-Outputs `outputs/results.json` with all metrics and `outputs/predictions.json` in nuScenes submission format.
+### Visualization
 
----
-
-## Visualisation
+Generates map-overlaid trajectory plots for visual debugging and presentation. Saves a grid format image to `outputs/viz/trajectory_predictions.png`.
 
 ```bash
 python visualize.py --dataroot ./data/nuscenes --n_samples 16
 ```
 
-Saves `outputs/viz/trajectory_predictions.png` — a grid of predicted paths overlaid on map rasters. Use this in your PPT.
+## Repository Structure
 
----
-
-## Key implementation details
-
-### Agent-frame normalisation
-Every sample is transformed so the agent's current position is the origin `(0,0)` and its heading points along the `+x` axis. This means the model learns _relative motion patterns_, not city-specific coordinates — essential for generalisation.
-
-### Winner-takes-all training
-During training, we only backpropagate through the mode with the **minimum FDE** to the ground truth. This prevents mode collapse (all K paths converging to the same prediction) and forces genuine diversity between modes.
-
-### Map-constrained goal prediction
-The GoalPredictor outputs K endpoint candidates. Using the map raster, trajectories that land on non-walkable pixels have higher reconstruction error, implicitly pushing goals toward walkable space.
-
-### Visibility weighting
-Annotations with low visibility (occluded agents) have noisy ground truth. We scale each sample's loss by `visibility_token / 4` so high-occlusion samples contribute less gradient.
-
-### MissRate metric
-A prediction is a _miss_ if **all K modes** have a maximum pointwise L2 distance > 2 m from ground truth. This is stricter than ADE/FDE and detects cases where the model is confidently wrong. We report this alongside ADE/FDE.
-
-### OffRoadRate
-We check the most-probable predicted trajectory against the drivable\_surface channel of the map raster. If any waypoint falls on a non-drivable pixel, that sample counts as off-road. This is a hidden metric in the nuScenes devkit that most teams won't report.
-
----
-
-## Repository structure
-
-```
+```text
 .
-├── config.py          All hyperparameters in one place
-├── dataset.py         nuScenes loading, normalisation, map rasterisation
-├── model.py           Full model architecture
-├── losses.py          WTA loss, ADE, FDE, goal loss
-├── train.py           Training loop with LR schedule + checkpointing
-├── evaluate.py        Evaluation: ADE, FDE, MissRate, OffRoadRate
-├── visualize.py       Trajectory visualisation overlaid on map
-├── requirements.txt
-├── checkpoints/       Saved model weights
-└── outputs/           Predictions JSON, results JSON, visualisations
+├── config.py          Centralized hyperparameters and settings
+├── dataset.py         nuScenes loading, agent-frame transforms, map rasterization
+├── evaluate.py        Validation evaluation (ADE, FDE, MissRate, OffRoadRate)
+├── losses.py          WTA, ADE, FDE, goal, and mode classification losses
+├── model.py           Full multi-modal network architecture
+├── train.py           Main training loop, AMP, and checkpointing
+├── visualize.py       Matplotlib overlay generation
+└── requirements.txt
 ```
-
----
 
 ## References
 
-- nuScenes prediction challenge: https://www.nuscenes.org/prediction
-- Trajectron++: Ivanovic & Pavone, ECCV 2020
-- AgentFormer: Yuan et al., ICCV 2021
-- DGCN\_ST\_LANE: nuScenes leaderboard leader (MinADE\_10 = 1.092)
+* nuScenes Prediction Challenge: [https://www.nuscenes.org/prediction](https://www.nuscenes.org/prediction)
+* Trajectron++: Ivanovic & Pavone, ECCV 2020
+* AgentFormer: Yuan et al., ICCV 2021

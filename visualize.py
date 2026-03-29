@@ -221,7 +221,7 @@ def main(args):
         collate_fn=collate_fn,
     )
 
-    n_cols = 2
+    n_cols = 3
     n_rows = math.ceil(n_samples / n_cols)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
     axes = axes.flatten() if n_samples > 1 else [axes]
